@@ -31,22 +31,25 @@ module Wasp.Analyzer.TypeChecker.Internal
     unify,
     unifyTypes,
     weaken,
+    makeUnionType,
   )
 where
 
 import Control.Arrow (left, second)
 import Control.Monad (foldM, void)
+import Data.Either (fromRight)
 import qualified Data.HashMap.Strict as M
+import qualified Data.HashSet as Set
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty, toList)
 import Data.Maybe (fromJust)
 import Wasp.Analyzer.Parser (AST)
 import qualified Wasp.Analyzer.Parser as P
+import Wasp.Analyzer.Parser.Ctx (fromWithCtx)
 import Wasp.Analyzer.Type
 import Wasp.Analyzer.TypeChecker.AST
 import Wasp.Analyzer.TypeChecker.Monad
 import Wasp.Analyzer.TypeChecker.TypeError
 import qualified Wasp.Analyzer.TypeDefinitions as TD
-import Wasp.Util.Control.Monad (foldMapM')
 
 check :: AST -> TypeChecker TypedAST
 check ast = hoistDeclarations ast >> checkAST ast
@@ -97,12 +100,10 @@ inferExprType = P.withCtx $ \ctx -> \case
   --       that would be assigned here.
   P.List values -> do
     typedValues <- mapM inferExprType values
-    case unify ctx <$> nonEmpty typedValues of
-      -- Apply [EmptyList].
-      Nothing -> return $ WithCtx ctx $ List [] EmptyListType
-      Just (Left e) -> throw e
-      Just (Right (unifiedValues, unifiedType)) ->
-        return $ WithCtx ctx $ List (toList unifiedValues) (ListType unifiedType)
+    let superType
+          | null typedValues = EmptyListType
+          | otherwise = ListType $ foldl1 unifyTypes $ exprType . fromWithCtx <$> typedValues
+    return $ WithCtx ctx $ List typedValues superType
   -- Apply [Dict], and also check that there are no duplicate keys in the dictionary.
   P.Dict entries -> do
     typedEntries <- mapM (\(key, expr) -> (key,) <$> inferExprType expr) entries
@@ -131,76 +132,93 @@ inferExprType = P.withCtx $ \ctx -> \case
       | key `M.member` m = throw $ mkTypeError ctx $ DictDuplicateField key
       | otherwise = return $ M.insert key value m
 
--- | Finds the strongest common type for all of the given expressions, "common" meaning
--- all the expressions can be typed with it and "strongest" meaning it is as specific
--- as possible. If such a type exists, it returns that type and all of the given expressions
--- typed with the new type. If no such type exists, it returns an error.
---
--- The following property is gauranteed:
---
--- * IF   @unify ctx exprs == Right (exprs', commonType)@
---   THEN @all ((==commonType) . exprType . fromWithCtx) exprs'@
---
--- First argument, `Ctx`, is the context of the top level structure or smth that contains all these expressions.
-unify :: P.Ctx -> NonEmpty (WithCtx TypedExpr) -> Either TypeError (NonEmpty (WithCtx TypedExpr), Type)
-unify ctx texprs@((WithCtx _ texprFirst) :| texprsRest) = do
-  superType <-
-    left (mkTypeError ctx . UnificationError) $
-      foldM unifyTypes (exprType texprFirst) texprsRest
-  left (mkTypeError ctx . WeakenError) $
-    (,superType) <$> mapM (weaken superType) texprs
+-- TODO: How come we need to weaken the entire tree, is it important to keep
+-- correct type information for child nodes. Do we even need the function
+-- "weaken" here if we know the correct type from above (superType)
+-- We thought about it: weaken assigns the calculated supertype to all child
+-- nodes which causes information loss. We decided it makes sense to keep node
+-- type information as precise as possible. In other words, each node should
+-- have the most narrow possible correct type.  Instead of calling weaken, we
+-- should most likely return the same tree with a different type at the top
 
--- | @unifyTypes t texpr@ finds the strongest type that both type @t@ and
--- type of typed expression @texpr@ are a sub-type of.
--- NOTE: The reason it operates on Type and TypedExpr and not just two Types is that
---   having a TypedExpr allows us to report the source position when we encounter a type error.
---   Anyway unification always happens for some typed expressions, so this makes sense.
-unifyTypes :: Type -> WithCtx TypedExpr -> Either TypeCoercionError Type
-unifyTypes typ (WithCtx _ texpr) | typ == exprType texpr = Right typ
+-- | @unifyTypes t1 t2@ finds the strongest type that both type @t1@ and @t2@
+-- are a sub-type of, with "strongest" meaning it is as specific as possible.
+-- We know such a type exists because we can always unify non-overlapping types
+-- into a union type.
+--
+-- NOTE: We decided NOT TO generalise types of lists of dictionaries for now.
+-- In other words, the expression `[{}, { b: "foo" }, { a: 4 }]` should resolve
+-- to: `[{} | {  b: string } | {  a:number }]` and not `[{ a?: -- string, b?: number }]`.
+-- This might make error messages uglier, but it simplifies the unification
+-- algorithm, especially in cases when the union type doesn't contain
+-- exclusively dictionaries. For example, unifying the union
+-- `{ a: string } | number | { b: number }` with the second approach is tricky
+-- because we'd have to somehow merge the union of dictionaries without
+-- affecting the number.
+unifyTypes :: Type -> Type -> Type
+unifyTypes t1 t2 | t1 == t2 = t1
 -- Apply [AnyList]: an empty list can unify with any other list
-unifyTypes EmptyListType (WithCtx _ (List _ typ)) = Right typ
-unifyTypes typ@(ListType _) (WithCtx _ (List _ EmptyListType)) = Right typ
--- Two non-empty lists unify only if their inner types unify
-unifyTypes typ@(ListType list1ElemType) texpr@(WithCtx _ (List (list2ElemTexpr1 : _) (ListType _))) =
-  -- NOTE: We use first element from the typed list (list2ElemTexpr1) as a "sample" to run unification against.
-  --   This is ok because this list is already typed, so we know all other elements have the same type.
-  --   We could have alternatively picked any other element from that list.
-  annotateError $ ListType <$> unifyTypes list1ElemType list2ElemTexpr1
-  where
-    annotateError = left (TypeCoercionError texpr typ . ReasonList)
--- Declarations and enums can not unify with anything
-unifyTypes t@(DeclType _) texpr = Left $ TypeCoercionError texpr t ReasonDecl
-unifyTypes t@(EnumType _) texpr = Left $ TypeCoercionError texpr t ReasonEnum
--- The unification of two dictionaries is defined by the [DictNone] and [DictSome] rules
-unifyTypes t@(DictType dict1EntryTypes) texpr@(WithCtx _ (Dict dict2Entries (DictType dict2EntryTypes))) = do
-  let keys = M.keysSet dict1EntryTypes <> M.keysSet dict2EntryTypes
-  unifiedType <- foldMapM' (\key -> M.singleton key <$> unifyEntryTypesForKey key) keys
-  return $ DictType unifiedType
-  where
-    unifyEntryTypesForKey :: String -> Either TypeCoercionError DictEntryType
-    unifyEntryTypesForKey key =
-      annotateError key $
-        case (M.lookup key dict1EntryTypes, M.lookup key dict2EntryTypes) of
-          (Nothing, Nothing) ->
-            error $
-              "impossible: unifyTypes.unifyEntryTypesForKey should be called"
-                ++ "with only the keys of entryTypes1 and entryTypes2"
-          -- [DictSome] on s, [DictNone] on t
-          (Just sType, Nothing) ->
-            Right $ DictOptional $ dictEntryType sType
-          -- [DictNone] on s, [DictSome] on t
-          (Nothing, Just tType) ->
-            Right $ DictOptional $ dictEntryType tType
-          -- Both require @key@, so it must be a required entry of the unified entry types
-          (Just (DictRequired sType), Just (DictRequired _)) ->
-            DictRequired <$> unifyTypes sType (fromJust $ lookup key dict2Entries)
-          -- One of s or t has @key@ optionally, so it must be an optional entry of the unified entry types
-          (Just sType, Just _) ->
-            DictOptional <$> unifyTypes (dictEntryType sType) (fromJust $ lookup key dict2Entries)
+unifyTypes EmptyListType t2@(ListType _) = t2
+unifyTypes t1@(ListType _) EmptyListType = t1
+unifyTypes t1 t2 = makeUnionType t1 t2
 
-    annotateError :: String -> Either TypeCoercionError a -> Either TypeCoercionError a
-    annotateError key = left (TypeCoercionError texpr t . ReasonDictWrongKeyType key)
-unifyTypes t texpr = Left $ TypeCoercionError texpr t ReasonUncoercable
+-- TODO: Perhaps it makes sense to move this to Analyzer/Types.hs and make
+-- it a smart constructor.
+-- TODO: Consider interesting case when two same types are given! Write tests for that.
+-- TODO: document.
+makeUnionType :: Type -> Type -> Type
+makeUnionType t1 t2 = reduceUnionType (UnionType t1 t2)
+
+-- TODO: Write tests
+reduceUnionType :: Type -> Type
+reduceUnionType unionType@(UnionType _ _) = foldl1 (flip UnionType) . Set.toList $ flatten unionType
+  where
+    flatten :: Type -> Set.HashSet Type
+    flatten (UnionType t1 t2) = Set.union (flatten t1) (flatten t2)
+    flatten t = Set.singleton t
+reduceUnionType _ = error "Cannot reduce non union type"
+
+-- -- Two non-empty lists unify only if their inner types unify
+-- unifyTypes typ@(ListType list1ElemType) texpr@(WithCtx _ (List (list2ElemTexpr1 : _) (ListType _))) =
+--   -- NOTE: We use first element from the typed list (list2ElemTexpr1) as a "sample" to run unification against.
+--   --   This is ok because this list is already typed, so we know all other elements have the same type.
+--   --   We could have alternatively picked any other element from that list.
+--   annotateError $ ListType <$> unifyTypes list1ElemType list2ElemTexpr1
+--   where
+--     annotateError = left (TypeCoercionError texpr typ . ReasonList)
+-- -- Declarations and enums can not unify with anything
+-- unifyTypes t@(DeclType _) texpr = Left $ TypeCoercionError texpr t ReasonDecl
+-- unifyTypes t@(EnumType _) texpr = Left $ TypeCoercionError texpr t ReasonEnum
+-- -- The unification of two dictionaries is defined by the [DictNone] and [DictSome] rules
+-- unifyTypes t@(DictType dict1EntryTypes) texpr@(WithCtx _ (Dict dict2Entries (DictType dict2EntryTypes))) = do
+--   let keys = M.keysSet dict1EntryTypes <> M.keysSet dict2EntryTypes
+--   unifiedType <- foldMapM' (\key -> M.singleton key <$> unifyEntryTypesForKey key) keys
+--   return $ DictType unifiedType
+--   where
+--     unifyEntryTypesForKey :: String -> Either TypeCoercionError DictEntryType
+--     unifyEntryTypesForKey key =
+--       annotateError key $
+--         case (M.lookup key dict1EntryTypes, M.lookup key dict2EntryTypes) of
+--           (Nothing, Nothing) ->
+--             error $
+--               "impossible: unifyTypes.unifyEntryTypesForKey should be called"
+--                 ++ "with only the keys of entryTypes1 and entryTypes2"
+--           -- [DictSome] on s, [DictNone] on t
+--           (Just sType, Nothing) ->
+--             Right $ DictOptional $ dictEntryType sType
+--           -- [DictNone] on s, [DictSome] on t
+--           (Nothing, Just tType) ->
+--             Right $ DictOptional $ dictEntryType tType
+--           -- Both require @key@, so it must be a required entry of the unified entry types
+--           (Just (DictRequired sType), Just (DictRequired _)) ->
+--             DictRequired <$> unifyTypes sType (fromJust $ lookup key dict2Entries)
+--           -- One of s or t has @key@ optionally, so it must be an optional entry of the unified entry types
+--           (Just sType, Just _) ->
+--             DictOptional <$> unifyTypes (dictEntryType sType) (fromJust $ lookup key dict2Entries)
+
+--     annotateError :: String -> Either TypeCoercionError a -> Either TypeCoercionError a
+--     annotateError key = left (TypeCoercionError texpr t . ReasonDictWrongKeyType key)
+-- unifyTypes t texpr = Left $ TypeCoercionError texpr t ReasonUncoercable
 
 -- | Converts a typed expression from its current type to the given weaker type, "weaker"
 -- meaning it is a super-type of the original type. If that is possible, it returns the
@@ -257,3 +275,6 @@ weaken t@(DictType entryTypes) texprwc@(WithCtx ctx (Dict entries _)) = do
     annotateKeyTypeError key = left (TypeCoercionError texprwc t . ReasonDictWrongKeyType key)
 -- All other cases can not be weakened
 weaken typ' expr = Left $ TypeCoercionError expr typ' ReasonUncoercable
+
+-- TODO: We need to add special case when left type is union type (while right type can be union type or not be an union type).
+-- TODO: Think about Dict! That is a bit tricky. We don't want to replace mechanism of optional fields completely with unions because that would be very inpractical when we want to define some Wasp dict to have optional fields. So we think we almost certainly want to do stuff with Dicts directly here in `weaken`. But maybe we also want to do it in `unifyTypes`, like we were doing before? Not sure, think about it.

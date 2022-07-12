@@ -1,16 +1,30 @@
 module Analyzer.TypeChecker.InternalTest where
 
 import Analyzer.TestUtil (ctx, fromWithCtx)
+import Data.Either (fromRight, isLeft)
 import qualified Data.HashMap.Strict as H
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Test.Tasty.Hspec
 import Test.Tasty.QuickCheck
+import Text.Printf (printf)
 import qualified Wasp.Analyzer.Parser as P
 import Wasp.Analyzer.Type
 import Wasp.Analyzer.TypeChecker.AST
 import Wasp.Analyzer.TypeChecker.Internal
 import Wasp.Analyzer.TypeChecker.Monad (Bindings, run, runWithBound)
 import Wasp.Analyzer.TypeChecker.TypeError
+  ( TypeCoercionError (TypeCoercionError),
+    TypeCoercionErrorReason (ReasonUncoercable),
+    TypeError,
+    TypeError'
+      ( DictDuplicateField,
+        NoDeclarationType,
+        QuoterUnknownTag,
+        UndefinedIdentifier,
+        WeakenError
+      ),
+    mkTypeError,
+  )
 import qualified Wasp.Analyzer.TypeDefinitions as TD
 import qualified Wasp.Analyzer.TypeDefinitions.Internal as TD
 
@@ -40,8 +54,18 @@ inferExprType' bindings expr = runWithBound bindings TD.empty $ inferExprType ex
 
 test :: String -> P.WithCtx P.Expr -> Either TypeError Type -> SpecWith (Arg Expectation)
 test name expr expected = it name $ do
+  -- TODO: The test does not test whether inferExprType returns the correct expression,
+  -- it only looks at its type. What we should do is receive the whole expected typed expression
+  -- and compare that one with the result we get.
+  -- I actually wrote such test below (test').
   let actual = exprType . fromWithCtx <$> inferExprType' H.empty expr
   actual `shouldBe` expected
+
+-- TODO: Rename this function and functions above that operate on inferExprType, actually consider moving them
+-- all somewhere closer to tests taht test inferExprType.
+test' :: String -> P.WithCtx P.Expr -> Either TypeError (WithCtx TypedExpr) -> SpecWith (Arg Expectation)
+test' name expr expectedTexpr = it name $ do
+  inferExprType' H.empty expr `shouldBe` expectedTexpr
 
 testSuccess :: String -> P.WithCtx P.Expr -> Type -> SpecWith (Arg Expectation)
 testSuccess name expr = test name expr . Right
@@ -67,35 +91,179 @@ spec_Internal = do
         wctx6 = WithCtx ctx6
         wctx7 = WithCtx ctx7
 
-    describe "unify" $ do
-      it "Doesn't affect 2 expressions of the same type" $ do
-        property $ \(a, b) ->
-          let initial = wctx2 (IntegerLiteral a) :| [wctx3 $ DoubleLiteral b]
-              actual = unify ctx1 initial
-           in actual == Right (initial, NumberType)
-      it "Unifies two same-typed dictionaries to their original type" $ do
-        let typ = DictType $ H.fromList [("a", DictRequired BoolType), ("b", DictOptional NumberType)]
-        let a = wctx2 $ Dict [("a", wctx3 $ BoolLiteral True), ("b", wctx4 $ IntegerLiteral 2)] typ
-        let b = wctx5 $ Dict [("a", wctx6 $ BoolLiteral True), ("b", wctx7 $ DoubleLiteral 3.14)] typ
-        let texprs = a :| [b]
-        unify ctx1 texprs
-          `shouldBe` Right (texprs, typ)
-      it "Unifies an empty dict and a dict with one property" $ do
-        let a = wctx2 $ Dict [] (DictType H.empty)
-        let b = wctx3 $ Dict [("a", wctx4 $ BoolLiteral True)] (DictType $ H.singleton "a" $ DictRequired BoolType)
-        let expectedType = DictType $ H.singleton "a" $ DictOptional BoolType
-        fmap (fmap (exprType . fromWithCtx) . fst) (unify ctx1 (a :| [b]))
-          `shouldBe` Right (expectedType :| [expectedType])
-      it "Is idempotent when unifying an empty dict and a singleton dict" $ do
-        let a = wctx2 $ Dict [] (DictType H.empty)
-        let b = wctx3 $ Dict [("a", wctx4 $ BoolLiteral True)] $ DictType $ H.singleton "a" $ DictRequired BoolType
-        unify ctx1 (a :| [b]) `shouldBe` (unify ctx1 (a :| [b]) >>= unify ctx1 . fst)
-      it "Unifies an empty list with any other list" $ do
-        let a = wctx2 $ List [] EmptyListType
-        let b = wctx3 $ List [wctx4 $ StringLiteral "a"] (ListType StringType)
-        let expected = ListType StringType
-        fmap (fmap (exprType . fromWithCtx) . fst) (unify ctx1 (a :| [b]))
-          `shouldBe` Right (expected :| [expected])
+    describe "unifyTypes" $ do
+      describe "Unifies two same types to themselves: a | a = a" $ do
+        let performTest = \t ->
+              it (show t) $
+                unifyTypes t t `shouldBe` t
+        mapM_
+          performTest
+          [ NumberType,
+            DictType $ H.fromList [("a", DictRequired BoolType)],
+            StringType,
+            ListType StringType,
+            UnionType NumberType StringType
+          ]
+
+      it "Unifies a list of type [a] and an empty list into a list of type [a]: [a] | [] = [a]" $ do
+        let listType = ListType StringType
+        unifyTypes listType EmptyListType `shouldBe` listType
+        unifyTypes EmptyListType listType `shouldBe` listType
+
+      describe "Unifies two different types by just constructing their union type" $ do
+        let performTest = \(t1, t2) ->
+              it (printf "For `%s` and `%s`" (show t1) (show t2)) $
+                unifyTypes t1 t2 `shouldBe` makeUnionType t1 t2
+        mapM_
+          performTest
+          [ (NumberType, StringType),
+            (DictType $ H.fromList [("a", DictRequired BoolType)], DictType $ H.fromList [("a", DictRequired NumberType)]),
+            (DictType $ H.fromList [("a", DictRequired BoolType)], DictType H.empty),
+            (NumberType, DictType $ H.fromList [("a", DictRequired BoolType)]),
+            (UnionType NumberType StringType, UnionType StringType BoolType)
+          ]
+
+    -- TODO: test makeUnionType.
+
+    describe "weaken" $ do
+      it "Should correctly weaken a simple expression to its supertype" $ do
+        weaken NumberType (wctx1 $ DoubleLiteral 1.16) `shouldBe` Right (wctx1 $ DoubleLiteral 1.16)
+      it "Should return an type coercion error when the provided type is not the expression's supertype" $ do
+        -- TODO: test the returned error more thoroughly
+        isLeft (weaken StringType (wctx1 $ DoubleLiteral 1.16)) `shouldBe` True
+        isLeft
+          ( weaken
+              (TupleType (StringType, NumberType, []))
+              (wctx1 $ Tuple (wctx2 $ StringLiteral "foo", wctx3 $ BoolLiteral True, []) (TupleType (StringType, BoolType, [])))
+          )
+          `shouldBe` True
+
+      -- TODO: property testing.
+      describe "Correctly weakens complex types (list, dictionary, tuple)" $ do
+        it "Should weaken empty list to any list type" $ do
+          weaken (ListType StringType) (wctx1 $ List [] EmptyListType) `shouldBe` Right (wctx1 $ List [] StringType)
+
+        it "Should weaken [T] to [T'] if T' is supertype of T without affecting types of list element expressions" $ do
+          let superType = makeUnionType StringType subType
+              subType = BoolType
+          weaken (ListType superType) (wctx1 $ List [] subType) `shouldBe` Right (wctx1 $ List [] superType)
+
+        -- TODO: we should test this for many possible different combinations
+        it "Should weaken (T, _) to (T', _) if T' is supertype of T" $ do
+          let texpr1 = wctx2 $ BoolLiteral True
+              texpr2 = wctx3 $ List [] EmptyListType
+              superType = makeUnionType StringType (exprType $ fromWithCtx texpr1)
+              texpr1Type = exprType $ fromWithCtx texpr1
+              texpr2Type = exprType $ fromWithCtx texpr2
+          weaken
+            (TupleType (superType, texpr2Type, []))
+            (wctx1 $ Tuple (texpr1, texpr2, []) (TupleType (texpr1Type, texpr2Type, [])))
+            `shouldBe` Right (wctx1 $ Tuple (texpr1, texpr2, []) (TupleType (superType, texpr2Type, [])))
+
+      -- { a: bool | string } > { a : string }
+      --
+      -- testing optional dictionary fields
+      it "Should fail when weakening { a?: T } to { a: T }" $ do
+        let subtype = DictType $ H.fromList [("a", DictOptional NumberType)]
+            supertype = DictType $ H.fromList [("a", DictRequired NumberType)]
+            mkTexprWithType t = wctx1 $ Dict [("a", wctx2 $ IntegerLiteral 2)] t
+        -- TODO: make test more informative (i.e., test for error message)
+        isLeft (weaken supertype (mkTexprWithType subtype)) `shouldBe` True
+      it "Should successfully weaken { a: T } to { a?: T }" $ do
+        let subtype = DictType $ H.fromList [("a", DictRequired NumberType)]
+            supertype = DictType $ H.fromList [("a", DictOptional NumberType)]
+            mkTexprWithType t = wctx1 $ Dict [("a", wctx2 $ IntegerLiteral 2)] t
+        weaken supertype (mkTexprWithType subtype) `shouldBe` Right (mkTexprWithType supertype)
+      it "Should fail when weakening { } to { a: T }" $ do
+        let subtype = DictType $ H.fromList []
+            supertype = DictType $ H.fromList [("a", DictRequired NumberType)]
+            mkTexprWithType t = wctx1 $ Dict [] t
+        isLeft (weaken supertype (mkTexprWithType subtype)) `shouldBe` True
+      -- NOTE: We could have allowed this, similar as Typescript does (structural typing),
+      --   but we decided to not allow it to avoid developer accidentaly defining unexisting fields
+      --   and thinking they do something.
+      it "Should fail when weakening { a: T } to { }" $ do
+        let subtype = DictType $ H.fromList [("a", DictRequired NumberType)]
+            supertype = DictType $ H.fromList []
+            mkTexprWithType t = wctx1 $ Dict [("a", wctx2 $ IntegerLiteral 2)] t
+        isLeft (weaken supertype (mkTexprWithType subtype)) `shouldBe` True
+      it "Should successfully weaken { } to { a?: T }" $ do
+        let subtype = DictType $ H.fromList []
+            supertype = DictType $ H.fromList [("a", DictOptional NumberType)]
+            mkTexprWithType t = wctx1 $ Dict [] t
+        weaken supertype (mkTexprWithType subtype) `shouldBe` Right (mkTexprWithType supertype)
+      it "Should fail when weakening { a?: T } to { }" $ do
+        let subtype = DictType $ H.fromList [("a", DictOptional NumberType)]
+            supertype = DictType $ H.fromList []
+            mkTexprWithType t = wctx1 $ Dict [("a", wctx2 $ IntegerLiteral 2)] t
+        isLeft (weaken supertype (mkTexprWithType subtype)) `shouldBe` True
+      describe "Dictionary D' is supertype of dictionary D if fields of D' are supertypes of fields of D." $ do
+        -- testing supertypes in dictionary fields (transparency of dictionary).
+        it "Should successfully weaken { a: T } to { a: T' } if T' is supertype of T" $ do
+          let subtype = DictType $ H.fromList [("a", DictRequired NumberType)]
+              supertype = DictType $ H.fromList [("a", DictRequired $ makeUnionType StringType NumberType)]
+              mkTexprWithType t = wctx1 $ Dict [("a", wctx2 $ IntegerLiteral 2)] t
+          weaken supertype (mkTexprWithType subtype) `shouldBe` Right (mkTexprWithType supertype)
+        it "Should successfully weaken { a?: T } to { a?: T' } if T' is supertype of T" $ do
+          let subtype = DictType $ H.fromList [("a", DictOptional NumberType)]
+              supertype = DictType $ H.fromList [("a", DictOptional $ makeUnionType StringType NumberType)]
+              mkTexprWithType t = wctx1 $ Dict [("a", wctx2 $ IntegerLiteral 2)] t
+          weaken supertype (mkTexprWithType subtype) `shouldBe` Right (mkTexprWithType supertype)
+        it "Should successfully weaken { a: T } to { a?: T' } if T' is supertype of T" $ do
+          let subtype = DictType $ H.fromList [("a", DictRequired NumberType)]
+              supertype = DictType $ H.fromList [("a", DictOptional $ makeUnionType StringType NumberType)]
+              mkTexprWithType t = wctx1 $ Dict [("a", wctx2 $ IntegerLiteral 2)] t
+          weaken supertype (mkTexprWithType subtype) `shouldBe` Right (mkTexprWithType supertype)
+        it "Should successfully weaken { a?: T } to { a: T' } if T' is supertype of T" $ do
+          let subtype = DictType $ H.fromList [("a", DictOptional NumberType)]
+              supertype = DictType $ H.fromList [("a", DictRequired $ makeUnionType StringType NumberType)]
+              mkTexprWithType t = wctx1 $ Dict [("a", wctx2 $ IntegerLiteral 2)] t
+          isLeft (weaken supertype (mkTexprWithType subtype)) `shouldBe` True
+
+      it "Should successfully weaken a complex dictionary" $ do
+        let subtype =
+              DictType $
+                H.fromList
+                  [ ("a", DictRequired $ makeUnionType NumberType StringType),
+                    ("b", DictRequired BoolType),
+                    ("c", DictRequired subtypeInnerDictType)
+                  ]
+            subtypeInnerDictType =
+              DictType $
+                H.fromList
+                  [ ("1", DictRequired BoolType),
+                    ("2", DictOptional $ ListType StringType)
+                  ]
+            supertype =
+              DictType $
+                H.fromList
+                  [ ("a", DictRequired $ makeUnionType BoolType (makeUnionType NumberType StringType)),
+                    ("b", DictOptional $ makeUnionType BoolType StringType),
+                    ( "c",
+                      DictRequired $
+                        DictType $
+                          H.fromList
+                            [ ("1", DictRequired BoolType),
+                              ("2", DictOptional $ ListType StringType),
+                              ("3", DictOptional NumberType)
+                            ]
+                    )
+                  ]
+            mkTexprWithType t =
+              wctx1 $
+                Dict
+                  [ ("a", wctx1 $ IntegerLiteral 2),
+                    ("b", wctx2 $ BoolLiteral True),
+                    ("c", wctx3 $ Dict [("1", wctx4 $ BoolLiteral False)] subtypeInnerDictType)
+                  ]
+                  t
+        weaken supertype (mkTexprWithType subtype) `shouldBe` Right (mkTexprWithType supertype)
+
+    -- TODO: test weaken with complex types (e.g., dicts, lists)
+    -- TODO: it seems that weaken currently doesn't support tuples
+    -- (e.g., we cannot weaken (bool, string) to (bool, string | number))
+    -- This is probably not the behavior we want, since all type constructors (i.e., lists, tuples, dicts)
+    -- should behave consistently.
 
     describe "inferExprType" $ do
       testSuccess "Types string literals as StringType" (wctx1 $ P.StringLiteral "string") StringType
@@ -142,16 +310,30 @@ spec_Internal = do
         "Type checks a list where all elements have the same type"
         (wctx1 $ P.List [wctx2 $ P.IntegerLiteral 5, wctx3 $ P.DoubleLiteral 1.6])
         (ListType NumberType)
-      testFail
-        "Fails to type check a list containing strings and numbers"
-        (wctx1 $ P.List [wctx2 $ P.IntegerLiteral 5, wctx3 $ P.StringLiteral "4"])
-        ( mkTypeError ctx1 $
-            UnificationError $
-              TypeCoercionError (wctx3 $ StringLiteral "4") NumberType ReasonUncoercable
+      test'
+        "Type checks a list containing expressions of different types (while keeping types of list elements specific)"
+        ( wctx1 $
+            P.List
+              [ wctx2 $ P.List [wctx3 $ P.IntegerLiteral 5],
+                wctx4 $ P.List [wctx5 $ P.BoolLiteral True],
+                wctx6 $ P.List []
+              ]
+        )
+        -- TODO: decide on a representation for union types (e.g., set, list, tree, all types are unions)
+        -- and correctly implement the equality instance.
+        ( Right
+            ( wctx1 $
+                List
+                  [ wctx2 $ List [wctx3 $ IntegerLiteral 5] (ListType NumberType),
+                    wctx4 $ List [wctx5 $ BoolLiteral True] (ListType BoolType),
+                    wctx6 $ List [] EmptyListType
+                  ]
+                  (ListType $ makeUnionType (ListType NumberType) (ListType BoolType))
+            )
         )
 
       testSuccess
-        "Type checks a list of dictionaries that unify but have different types"
+        "Creates a union when unifying a list of dictionaries with different fields"
         ( wctx1 $
             P.List
               [ wctx2 $ P.Dict [("a", wctx3 $ P.IntegerLiteral 5)],
@@ -160,37 +342,25 @@ spec_Internal = do
               ]
         )
         ( ListType $
-            DictType $
-              H.fromList
-                [ ("a", DictOptional NumberType),
-                  ("b", DictOptional StringType)
-                ]
+            UnionType
+              (DictType (H.fromList []))
+              ( UnionType
+                  (DictType $ H.fromList [("b", DictRequired StringType)])
+                  (DictType $ H.fromList [("a", DictRequired NumberType)])
+              )
         )
-      testFail
-        "Fails to type check a list of dictionaries that do not unify"
+      testSuccess
+        "Creates a union when unifying two dictionaries with the same field with a different type"
         ( wctx1 $
             P.List
               [ wctx2 $ P.Dict [("a", wctx3 $ P.IntegerLiteral 5)],
                 wctx4 $ P.Dict [("a", wctx5 $ P.StringLiteral "string")]
               ]
         )
-        ( mkTypeError ctx1 $
-            UnificationError $
-              TypeCoercionError
-                ( wctx4 $
-                    Dict
-                      [("a", wctx5 $ StringLiteral "string")]
-                      (DictType $ H.singleton "a" (DictRequired StringType))
-                )
-                (DictType $ H.singleton "a" (DictRequired NumberType))
-                ( ReasonDictWrongKeyType
-                    "a"
-                    ( TypeCoercionError
-                        (wctx5 $ StringLiteral "string")
-                        NumberType
-                        ReasonUncoercable
-                    )
-                )
+        ( ListType $
+            UnionType
+              (DictType $ H.fromList [("a", DictRequired StringType)])
+              (DictType $ H.fromList [("a", DictRequired NumberType)])
         )
 
       describe "Type checks a tuple" $ do
